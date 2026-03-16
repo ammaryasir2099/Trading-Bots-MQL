@@ -1,0 +1,288 @@
+//+------------------------------------------------------------------+
+//| XAUUSD Decision Engine EA - ULTIMATE FIXED (LOSS-PROOF)           |
+//+------------------------------------------------------------------+
+#property strict
+#property version "2.13"
+
+// ================= INPUTS =================
+input double   LotSize         = 0.01;
+input double   BuyThreshold    = 0.15;
+input double   SellThreshold   = -0.25;
+input int      CooldownSeconds = 10;
+input double   MaxSpreadPoints = 700;
+input bool     EnableAlerts    = true;
+input double   TrailingPercent = .80;
+
+// ================= GLOBALS =================
+datetime lastTradeTime = 0;
+double entryEquity = 0.0;
+double peakEquity  = 0.0;
+
+string EA_Status = "INIT";
+string EA_LastAction = "None";
+
+double LastDecisionScore = 0.0;
+
+// 🔒 EQUITY LOCK
+bool TradingRestricted = false;
+double EquityLockLevel = 17.0;
+
+// ⏳ STARTUP DELAY
+datetime EA_StartTime = 0;
+bool FirstTradeDelayActive = true;
+int FirstTradeDelaySeconds = 30;
+
+// Indicator handles
+int hEMA20, hEMA50, hEMA200;
+int hRSI, hMACD, hATR;
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   hEMA20  = iMA(_Symbol, PERIOD_M5, 20, 0, MODE_EMA, PRICE_CLOSE);
+   hEMA50  = iMA(_Symbol, PERIOD_M5, 50, 0, MODE_EMA, PRICE_CLOSE);
+   hEMA200 = iMA(_Symbol, PERIOD_M5, 200,0, MODE_EMA, PRICE_CLOSE);
+   hRSI    = iRSI(_Symbol, PERIOD_M5, 14, PRICE_CLOSE);
+   hMACD   = iMACD(_Symbol, PERIOD_M5, 12,26,9,PRICE_CLOSE);
+   hATR    = iATR(_Symbol, PERIOD_M5, 14);
+
+   if(hEMA20<0 || hEMA50<0 || hEMA200<0 || hRSI<0 || hMACD<0 || hATR<0)
+      return INIT_FAILED;
+
+   EA_Status   = "Running";
+   EA_StartTime = TimeCurrent();
+
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   double score = 0.0;
+   if(!ComputeDecisionScore(score))
+      return;
+
+   LastDecisionScore = score;
+   DrawDashboard();
+
+   // 🔒 HARD STOP AFTER EQUITY TARGET
+   if(TradingRestricted)
+   {
+      EA_Status = "EQUITY TARGET HIT (LOCKED)";
+      return;
+   }
+
+   // ⏳ FIRST START DELAY
+   if(FirstTradeDelayActive)
+   {
+      int elapsed = (int)(TimeCurrent() - EA_StartTime);
+      if(elapsed < FirstTradeDelaySeconds)
+      {
+         EA_Status = "Waiting (" + IntegerToString(FirstTradeDelaySeconds - elapsed) + "s)";
+         return;
+      }
+      FirstTradeDelayActive = false;
+   }
+
+   if(SpreadTooHigh())
+   {
+      EA_Status = "High spread";
+      return;
+   }
+
+   ManageTrailingSL();
+
+   if(PositionSelect(_Symbol))
+   {
+      EA_Status = "In trade";
+      return;
+   }
+
+   if(TimeCurrent() - lastTradeTime < CooldownSeconds)
+   {
+      EA_Status = "Cooldown";
+      return;
+   }
+
+   if(score >= BuyThreshold)
+      ExecuteTrade(ORDER_TYPE_BUY);
+   else if(score <= SellThreshold)
+      ExecuteTrade(ORDER_TYPE_SELL);
+   else
+      EA_Status = "Scanning";
+}
+
+//+------------------------------------------------------------------+
+bool ComputeDecisionScore(double &score)
+{
+   double ema20[1], ema50[1], ema200[1];
+   double rsi[1];
+   double macdMain[1], macdSignal[1];
+   double atr[1];
+
+   if(CopyBuffer(hEMA20,0,0,1,ema20)<=0) return false;
+   if(CopyBuffer(hEMA50,0,0,1,ema50)<=0) return false;
+   if(CopyBuffer(hEMA200,0,0,1,ema200)<=0) return false;
+   if(CopyBuffer(hRSI,0,0,1,rsi)<=0) return false;
+   if(CopyBuffer(hMACD,0,0,1,macdMain)<=0) return false;
+   if(CopyBuffer(hMACD,1,0,1,macdSignal)<=0) return false;
+   if(CopyBuffer(hATR,0,0,1,atr)<=0) return false;
+
+   double emaScore = ((ema20[0]-ema50[0]) + (ema50[0]-ema200[0])) / (ema200[0]*2);
+   emaScore = MathMax(-1.0, MathMin(1.0, emaScore));
+
+   double rsiScore = (rsi[0]-50)/50.0;
+   rsiScore = MathMax(-1.0, MathMin(1.0, rsiScore));
+
+   double macdScore = macdMain[0] - macdSignal[0];
+   macdScore = MathMax(-1.0, MathMin(1.0, macdScore));
+
+   int lookback = 20;
+   if(Bars(_Symbol, PERIOD_M5) < lookback) { score=0; return true; }
+
+   double volSum = 0;
+   for(int i=0; i<lookback; i++) volSum += iVolume(_Symbol, PERIOD_M5, i);
+   double volMA = volSum/lookback;
+   double tickVol = iVolume(_Symbol, PERIOD_M5, 0);
+
+   double volScore = (tickVol - volMA)/volMA;
+   volScore = MathMax(-1.0, MathMin(1.0, volScore));
+
+   score = 0.35*emaScore + 0.25*rsiScore + 0.25*macdScore + 0.15*volScore;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+void ExecuteTrade(ENUM_ORDER_TYPE type)
+{
+   MqlTradeRequest req;
+   MqlTradeResult  res;
+   ZeroMemory(req);
+   ZeroMemory(res);
+
+   req.action    = TRADE_ACTION_DEAL;
+   req.symbol    = _Symbol;
+   req.volume    = LotSize;
+   req.type      = type;
+   req.price     = (type==ORDER_TYPE_BUY)?SymbolInfoDouble(_Symbol,SYMBOL_ASK)
+                                         :SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   req.deviation = 20;
+   req.magic     = 777;
+
+   if(!OrderSend(req,res) || res.retcode!=TRADE_RETCODE_DONE)
+      return;
+
+   lastTradeTime = TimeCurrent();
+   entryEquity   = AccountInfoDouble(ACCOUNT_EQUITY);
+   peakEquity    = entryEquity;
+
+   EA_Status     = "Trade opened";
+   EA_LastAction = "New trade";
+}
+
+//+------------------------------------------------------------------+
+double peakProfit = 0;
+
+void ManageTrailingSL()
+{
+   if(!PositionSelect(_Symbol)) return;
+
+   double posProfit = PositionGetDouble(POSITION_PROFIT);
+   if(posProfit <= 0) return;
+
+   ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   ulong ticket = (ulong)PositionGetInteger(POSITION_TICKET);
+
+   static ulong lastTicket = 0;
+   if(ticket != lastTicket)
+   {
+      peakProfit = posProfit;
+      lastTicket = ticket;
+   }
+
+   if(posProfit > peakProfit)
+      peakProfit = posProfit;
+
+   double atrBuf[1];
+   if(CopyBuffer(hATR, 0, 0, 1, atrBuf) <= 0) return;
+
+   double minProfitToTrail = MathMax(0.5, atrBuf[0] * 0.30);
+   if(peakProfit < minProfitToTrail) return;
+
+   double trailAmount = peakProfit * TrailingPercent / 100.0;
+
+   if(posProfit < (peakProfit - trailAmount))
+      ClosePosition(ticket, posType);
+}
+
+//+------------------------------------------------------------------+
+void ClosePosition(ulong ticket, ENUM_POSITION_TYPE posType)
+{
+   if(!PositionSelect(_Symbol)) return;
+   if(PositionGetDouble(POSITION_PROFIT) < 0) return;
+
+   MqlTradeRequest req;
+   MqlTradeResult  res;
+   ZeroMemory(req);
+   ZeroMemory(res);
+
+   req.action   = TRADE_ACTION_DEAL;
+   req.symbol   = _Symbol;
+   req.position = ticket;
+   req.volume   = PositionGetDouble(POSITION_VOLUME);
+   req.deviation= 20;
+   req.magic    = 777;
+   req.type     = (posType==POSITION_TYPE_BUY)?ORDER_TYPE_SELL:ORDER_TYPE_BUY;
+   req.price    = (req.type==ORDER_TYPE_BUY)?SymbolInfoDouble(_Symbol,SYMBOL_ASK)
+                                            :SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   if(OrderSend(req,res) && res.retcode==TRADE_RETCODE_DONE)
+   {
+      lastTradeTime = TimeCurrent();
+
+      // 🔒 LOCK TRADING AFTER EQUITY TARGET
+      if(AccountInfoDouble(ACCOUNT_EQUITY) >= EquityLockLevel)
+      {
+         TradingRestricted = true;
+         EA_LastAction = "Equity target hit - Trading locked";
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+bool SpreadTooHigh()
+{
+   double spread = (SymbolInfoDouble(_Symbol,SYMBOL_ASK) -
+                    SymbolInfoDouble(_Symbol,SYMBOL_BID))/_Point;
+   return spread > MaxSpreadPoints;
+}
+
+//+------------------------------------------------------------------+
+void DrawDashboard()
+{
+   string delayText = "None";
+   if(FirstTradeDelayActive)
+   {
+      int remain = FirstTradeDelaySeconds - (int)(TimeCurrent() - EA_StartTime);
+      if(remain < 0) remain = 0;
+      delayText = IntegerToString(remain) + " sec";
+   }
+
+   Comment(
+      "XAUUSD Decision EA - LOSS-PROOF\n",
+      "----------------------------------\n",
+      "Status                : ", EA_Status, "\n",
+      "Startup Delay         : ", delayText, "\n",
+      "Symbol                : ", _Symbol, "\n",
+      "Equity                : ", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY),2), "\n",
+      "Peak Equity           : ", DoubleToString(peakEquity,2), "\n",
+      "----------------------------------\n",
+      "Live Decision Score   : ", DoubleToString(LastDecisionScore,3), "\n",
+      "BUY decision at ≥     : ", DoubleToString(BuyThreshold,2), "\n",
+      "SELL decision at ≤    : ", DoubleToString(SellThreshold,2), "\n",
+      "Cooldown (sec)        : ", CooldownSeconds, "\n",
+      "----------------------------------\n",
+      "Last Action           : ", EA_LastAction
+   );
+}
+//+------------------------------------------------------------------+
