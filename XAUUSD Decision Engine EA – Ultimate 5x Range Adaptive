@@ -1,0 +1,411 @@
+//+------------------------------------------------------------------+
+//| XAUUSD Decision Engine EA - ULTIMATE SUPER (5x Buy/Sell Ranges) |
+//+------------------------------------------------------------------+
+#property strict
+#property version "2.36"
+
+// ================= INPUTS =================
+input double   LotSize = 0.01;
+
+// ===== BUY RANGES =====
+input double BuyRangeMin1 = 0.15;
+input double BuyRangeMax1 = 0.20;
+input int    BuyHoldSeconds1 = 3;
+
+input double BuyRangeMin2 = 0.21;
+input double BuyRangeMax2 = 0.25;
+input int    BuyHoldSeconds2 = 30;
+
+input double BuyRangeMin3 = 0.26;
+input double BuyRangeMax3 = 0.30;
+input int    BuyHoldSeconds3 = 30;
+
+input double BuyRangeMin4 = 0.31;
+input double BuyRangeMax4 = 0.35;
+input int    BuyHoldSeconds4 = 30;
+
+input double BuyRangeMin5 = 0.36;
+input double BuyRangeMax5 = 0.40;
+input int    BuyHoldSeconds5 = 30;
+
+// ===== SELL RANGES =====
+input double SellRangeMin1 = -0.20;
+input double SellRangeMax1 = -0.15;
+input int    SellHoldSeconds1 = 3;
+
+input double SellRangeMin2 = -0.25;
+input double SellRangeMax2 = -0.21;
+input int    SellHoldSeconds2 = 30;
+
+input double SellRangeMin3 = -0.30;
+input double SellRangeMax3 = -0.26;
+input int    SellHoldSeconds3 = 30;
+
+input double SellRangeMin4 = -0.35;
+input double SellRangeMax4 = -0.31;
+input int    SellHoldSeconds4 = 30;
+
+input double SellRangeMin5 = -0.40;
+input double SellRangeMax5 = -0.36;
+input int    SellHoldSeconds5 = 30;
+
+input int      CooldownSeconds = 10;
+input double   MaxSpreadPoints = 700;
+input double   TrailingPercent = 1;
+input int      CloseCooldownSeconds = 20;
+input double   ScoreZoneMin = -0.1;
+input double   ScoreZoneMax = 0.1;
+input int      MinSecondsInZone = 3;
+
+// ================= GLOBALS =================
+datetime lastTradeTime = 0;
+datetime lastCloseTime = 0;
+double entryEquity = 0.0;
+double peakEquity  = 0.0;
+
+// --- Display tracking ---
+int activeRangeIndex = -1;
+string activeRangeType = "NONE";
+int activeHoldRemaining = 0;
+
+string EA_Status = "INIT";
+string EA_LastAction = "None";
+double LastDecisionScore = 0.0;
+
+// Indicator handles
+int hEMA20, hEMA50, hEMA200;
+int hRSI, hMACD, hATR;
+
+// Trailing
+double peakProfit = 0;
+static ulong lastTicket = 0;
+
+// Zone logic
+datetime zoneStartTime = 0;
+double secondsInZone = 0;
+
+// Buy/Sell timers
+datetime buyRangeTimer[5];
+datetime sellRangeTimer[5];
+
+// Logging
+datetime lastLogTime = 0;
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   hEMA20  = iMA(_Symbol, PERIOD_M5, 20, 0, MODE_EMA, PRICE_CLOSE);
+   hEMA50  = iMA(_Symbol, PERIOD_M5, 50, 0, MODE_EMA, PRICE_CLOSE);
+   hEMA200 = iMA(_Symbol, PERIOD_M5, 200,0, MODE_EMA, PRICE_CLOSE);
+   hRSI    = iRSI(_Symbol, PERIOD_M5, 14, PRICE_CLOSE);
+   hMACD   = iMACD(_Symbol, PERIOD_M5, 12,26,9,PRICE_CLOSE);
+   hATR    = iATR(_Symbol, PERIOD_M5, 14);
+
+   if(hEMA20<0 || hEMA50<0 || hEMA200<0 || hRSI<0 || hMACD<0 || hATR<0)
+      return INIT_FAILED;
+
+   EA_Status = "Running";
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   double score = 0.0;
+   if(!ComputeDecisionScore(score)) return;
+   LastDecisionScore = score;
+
+   DrawDashboard();  // enhanced display
+
+   if(TimeCurrent() != lastLogTime)
+   {
+      lastLogTime = TimeCurrent();
+      PrintFormat("LOG | Time=%s | Score=%.3f | Equity=%.2f | Status=%s",
+                  TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS),
+                  score, AccountInfoDouble(ACCOUNT_EQUITY), EA_Status);
+   }
+
+   if(SpreadTooHigh())
+   {
+      EA_Status="High spread";
+      return;
+   }
+
+   ManageTrailingSL();
+
+   if(TimeCurrent() - lastCloseTime < CloseCooldownSeconds)
+   {
+      EA_Status="Close cooldown";
+      return;
+   }
+
+   if(PositionSelect(_Symbol))
+   {
+      EA_Status="In trade";
+      return;
+   }
+
+   if(TimeCurrent() - lastTradeTime < CooldownSeconds)
+   {
+      EA_Status="Trade cooldown";
+      return;
+   }
+
+   if(score >= ScoreZoneMin && score <= ScoreZoneMax)
+   {
+      if(zoneStartTime==0) zoneStartTime=TimeCurrent();
+      if(TimeCurrent()-zoneStartTime >= MinSecondsInZone)
+      {
+         EA_Status="Indecision zone";
+         return;
+      }
+   }
+   else zoneStartTime=0;
+
+   // Buy ranges arrays
+   double buyMin[5]={BuyRangeMin1,BuyRangeMin2,BuyRangeMin3,BuyRangeMin4,BuyRangeMin5};
+   double buyMax[5]={BuyRangeMax1,BuyRangeMax2,BuyRangeMax3,BuyRangeMax4,BuyRangeMax5};
+   int buyHold[5]={BuyHoldSeconds1,BuyHoldSeconds2,BuyHoldSeconds3,BuyHoldSeconds4,BuyHoldSeconds5};
+
+   // Loop over buy ranges
+   for(int i=0;i<5;i++)
+   {
+      if(score>=buyMin[i] && score<=buyMax[i])
+      {
+         if(buyRangeTimer[i]==0) buyRangeTimer[i]=TimeCurrent();
+         activeRangeIndex = i + 1;
+         activeRangeType  = "BUY";
+         activeHoldRemaining = buyHold[i] - (int)(TimeCurrent() - buyRangeTimer[i]);
+
+         if(TimeCurrent()-buyRangeTimer[i]>=buyHold[i])
+         {
+            ExecuteTrade(ORDER_TYPE_BUY);
+            buyRangeTimer[i]=0;
+            return;
+         }
+      }
+      else buyRangeTimer[i]=0;
+   }
+
+   // Sell ranges arrays
+   double sellMin[5]={SellRangeMin1,SellRangeMin2,SellRangeMin3,SellRangeMin4,SellRangeMin5};
+   double sellMax[5]={SellRangeMax1,SellRangeMax2,SellRangeMax3,SellRangeMax4,SellRangeMax5};
+   int sellHold[5]={SellHoldSeconds1,SellHoldSeconds2,SellHoldSeconds3,SellHoldSeconds4,SellHoldSeconds5};
+
+   // Loop over sell ranges
+   for(int i=0;i<5;i++)
+   {
+      if(score>=sellMin[i] && score<=sellMax[i])
+      {
+         if(sellRangeTimer[i]==0) sellRangeTimer[i]=TimeCurrent();
+         activeRangeIndex = i + 1;
+         activeRangeType  = "SELL";
+         activeHoldRemaining = sellHold[i] - (int)(TimeCurrent() - sellRangeTimer[i]);
+
+         if(TimeCurrent()-sellRangeTimer[i]>=sellHold[i])
+         {
+            ExecuteTrade(ORDER_TYPE_SELL);
+            sellRangeTimer[i]=0;
+            return;
+         }
+      }
+      else sellRangeTimer[i]=0;
+   }
+
+   // If no range active
+   EA_Status="Scanning";
+   activeRangeIndex = -1;
+   activeRangeType  = "NONE";
+   activeHoldRemaining = 0;
+}
+
+//+------------------------------------------------------------------+
+bool ComputeDecisionScore(double &score)
+{
+   double ema20[1], ema50[1], ema200[1];
+   double rsi[1];
+   double macdMain[1], macdSignal[1];
+   double atr[1];
+
+   if(CopyBuffer(hEMA20,0,0,1,ema20)<=0) return false;
+   if(CopyBuffer(hEMA50,0,0,1,ema50)<=0) return false;
+   if(CopyBuffer(hEMA200,0,0,1,ema200)<=0) return false;
+   if(CopyBuffer(hRSI,0,0,1,rsi)<=0) return false;
+   if(CopyBuffer(hMACD,0,0,1,macdMain)<=0) return false;
+   if(CopyBuffer(hMACD,1,0,1,macdSignal)<=0) return false;
+   if(CopyBuffer(hATR,0,0,1,atr)<=0) return false;
+
+   double emaScore=((ema20[0]-ema50[0])+(ema50[0]-ema200[0]))/(ema200[0]*2);
+   emaScore=MathMax(-1.0,MathMin(1.0,emaScore));
+
+   double rsiScore=(rsi[0]-50)/50.0;
+   rsiScore=MathMax(-1.0,MathMin(1.0,rsiScore));
+
+   double macdScore=macdMain[0]-macdSignal[0];
+   macdScore=MathMax(-1.0,MathMin(1.0,macdScore));
+
+   int lookback=20;
+   if(Bars(_Symbol,PERIOD_M5)<lookback){score=0;return true;}
+
+   double volSum=0;
+   for(int i=0;i<lookback;i++) volSum+=iVolume(_Symbol,PERIOD_M5,i);
+   double volMA=volSum/lookback;
+   double volScore=(iVolume(_Symbol,PERIOD_M5,0)-volMA)/volMA;
+   volScore=MathMax(-1.0,MathMin(1.0,volScore));
+
+   score=0.35*emaScore+0.25*rsiScore+0.25*macdScore+0.15*volScore;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+// Trailing SL (SAFE VERSION)
+//+------------------------------------------------------------------+
+void ManageTrailingSL()
+{
+   // If no open position, exit
+   if(!PositionSelect(_Symbol)) return;
+
+   double posProfit = PositionGetDouble(POSITION_PROFIT);
+   double volume    = PositionGetDouble(POSITION_VOLUME);
+   ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   ulong ticket    = (ulong)PositionGetInteger(POSITION_TICKET);
+
+   // Only update peak when new ticket
+   if(ticket != lastTicket)
+   {
+       peakProfit = posProfit;
+       lastTicket = ticket;
+   }
+
+   // Update peak if current profit is higher
+   if(posProfit > peakProfit) peakProfit = posProfit;
+
+   // Get ATR value
+   double atr = 0.0;
+   double atrVal[1];
+   if(CopyBuffer(hATR,0,0,1,atrVal) > 0) atr = atrVal[0];
+
+   // Minimum profit before trailing activates (safe threshold)
+   double minProfitToTrail = MathMax(0.5, atr*0.3);
+
+   // If peak profit hasn't reached minimal threshold, do not trail
+   if(peakProfit < minProfitToTrail) return;
+
+   // Trailing calculation
+   double trailAmount = peakProfit * TrailingPercent / 100.0;
+
+   // Only close if current profit drops below peak minus trail
+   if(posProfit < (peakProfit - trailAmount))
+   {
+       PrintFormat("Trailing SL triggered | Ticket=%I64u | Profit=%.2f | Peak=%.2f | Trail=%.2f",
+                   ticket, posProfit, peakProfit, trailAmount);
+
+       ClosePosition(ticket);  // Use existing ClosePosition function
+   }
+}
+//+------------------------------------------------------------------+
+void ClosePosition(ulong ticket)
+{
+   MqlTradeRequest req;
+   MqlTradeResult res;
+   MqlTick tick;
+   SymbolInfoTick(_Symbol,tick);
+
+   ENUM_POSITION_TYPE type=(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+   ZeroMemory(req);
+   req.action=TRADE_ACTION_DEAL;
+   req.position=ticket;
+   req.symbol=_Symbol;
+   req.volume=PositionGetDouble(POSITION_VOLUME);
+   req.magic=777;
+   req.deviation=50;
+
+   req.type=(type==POSITION_TYPE_BUY)?ORDER_TYPE_SELL:ORDER_TYPE_BUY;
+   req.price=(req.type==ORDER_TYPE_BUY)?tick.ask:tick.bid;
+
+   OrderSend(req,res);
+   lastCloseTime=TimeCurrent();
+   EA_LastAction="Trailing exit";
+}
+
+//+------------------------------------------------------------------+
+bool SpreadTooHigh()
+{
+   double spread=(SymbolInfoDouble(_Symbol,SYMBOL_ASK)-SymbolInfoDouble(_Symbol,SYMBOL_BID))/_Point;
+   return spread>MaxSpreadPoints;
+}
+
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+// Enhanced Dashboard - Copy-Paste Replaceable
+//+------------------------------------------------------------------+
+void DrawDashboard()
+{
+   // --- Active Range Info ---
+   string rangeInfo;
+   if(activeRangeIndex > 0)
+      rangeInfo = activeRangeType + " Range " + (string)activeRangeIndex +
+                  " | Hold left: " + (string)MathMax(0, activeHoldRemaining) + "s";
+   else
+      rangeInfo = "No active range";
+
+   // --- Cooldown Timers ---
+   int tradeCD = MathMax(0, CooldownSeconds - (int)(TimeCurrent() - lastTradeTime));
+   int closeCD = MathMax(0, CloseCooldownSeconds - (int)(TimeCurrent() - lastCloseTime));
+
+   string tradeCDStr = (tradeCD > 0) ? (string)tradeCD + "s" : "READY";
+   string closeCDStr = (closeCD > 0) ? (string)closeCD + "s" : "READY";
+
+   // --- Spread ---
+   double spreadPts = (SymbolInfoDouble(_Symbol,SYMBOL_ASK) - SymbolInfoDouble(_Symbol,SYMBOL_BID))/_Point;
+
+   // --- Zone Status ---
+   string zoneStatus = (LastDecisionScore >= ScoreZoneMin && LastDecisionScore <= ScoreZoneMax)
+                        ? "INDECISION" : "TREND";
+
+   // --- Print Enhanced Dashboard ---
+   Comment(
+      "==============================\n",
+      "  XAUUSD DECISION ENGINE EA\n",
+      "==============================\n",
+      " Status         : ", EA_Status, "\n",
+      " Last Action    : ", EA_LastAction, "\n",
+      "------------------------------\n",
+      " Decision Score : ", DoubleToString(LastDecisionScore,3), "\n",
+      " Zone Status    : ", zoneStatus, "\n",
+      "------------------------------\n",
+      " Active Range   : ", rangeInfo, "\n",
+      "------------------------------\n",
+      " Equity         : ", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY),2), "\n",
+      " Spread (pts)   : ", DoubleToString(spreadPts,1), "\n",
+      " Trade Cooldown : ", tradeCDStr, "\n",
+      " Close Cooldown : ", closeCDStr, "\n",
+      "=============================="
+   );
+}
+//+------------------------------------------------------------------+
+void ExecuteTrade(ENUM_ORDER_TYPE type)
+{
+   MqlTradeRequest req;
+   MqlTradeResult res;
+   MqlTick tick;
+   SymbolInfoTick(_Symbol,tick);
+
+   ZeroMemory(req);
+   req.action=TRADE_ACTION_DEAL;
+   req.symbol=_Symbol;
+   req.volume=LotSize;
+   req.magic=777;
+   req.deviation=50;
+   req.type=type;
+   req.price=(type==ORDER_TYPE_BUY)?tick.ask:tick.bid;
+
+   if(OrderSend(req,res) && res.retcode==TRADE_RETCODE_DONE)
+   {
+      lastTradeTime=TimeCurrent();
+      EA_LastAction="New trade";
+      EA_Status="Trade opened";
+   }
+}
