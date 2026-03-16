@@ -1,0 +1,243 @@
+//+------------------------------------------------------------------+
+//| XAUUSD 5-Factor Adaptive No-Loss EA                               |
+//+------------------------------------------------------------------+
+#property strict
+#property version "3.2"
+#property description "5-factor adaptive EA, profit-only trailing, dynamic entry & management"
+
+// ================= INPUTS =================
+input double LotSize           = 0.01;
+input double TrailingPercent   = 0.3;      // 30% retrace for profit locking
+input int    CooldownSeconds   = 10;       // Global cooldown
+input double MaxSpreadPoints   = 700;      // Max allowed spread in points
+input int    StartupDelay      = 30;       // Startup observation delay in seconds
+
+// ================= GLOBALS =================
+datetime EA_StartTime          = 0;
+bool     FirstDelayActive      = true;
+datetime lastTradeTime         = 0;
+double   LastDecisionScore     = 0.0;
+double   PeakProfit            = 0.0;
+ulong    LastTicket            = 0;
+
+string EA_Status               = "INIT";
+string EA_LastAction           = "None";
+
+// Factor values
+double FactorTrend             = 0.0;
+double FactorMomentum          = 0.0;
+double FactorVolatility        = 0.0;
+double FactorOscillator        = 0.0;
+double FactorVolume            = 0.0;
+
+// Indicator handles
+int hEMA20, hEMA50, hEMA200;
+int hRSI, hMACD;
+int hATR;
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   hEMA20  = iMA(_Symbol, PERIOD_M5, 20, 0, MODE_EMA, PRICE_CLOSE);
+   hEMA50  = iMA(_Symbol, PERIOD_M5, 50, 0, MODE_EMA, PRICE_CLOSE);
+   hEMA200 = iMA(_Symbol, PERIOD_M5, 200,0, MODE_EMA, PRICE_CLOSE);
+   hRSI    = iRSI(_Symbol, PERIOD_M5, 14, PRICE_CLOSE);
+   hMACD   = iMACD(_Symbol, PERIOD_M5, 12,26,9,PRICE_CLOSE);
+   hATR    = iATR(_Symbol, PERIOD_M5, 14);
+
+   if(hEMA20<0 || hEMA50<0 || hEMA200<0 || hRSI<0 || hMACD<0 || hATR<0)
+      return(INIT_FAILED);
+
+   EA_StartTime = TimeCurrent();
+   EA_Status    = "Running";
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // ⏳ STARTUP DELAY
+   if(FirstDelayActive)
+   {
+      if(TimeCurrent() - EA_StartTime < StartupDelay)
+      {
+         EA_Status = "Observing market...";
+         DrawDashboard();
+         return;
+      }
+      FirstDelayActive = false;
+   }
+
+   if(SpreadTooHigh()) 
+   { 
+      EA_Status = "High Spread"; 
+      DrawDashboard();
+      return; 
+   }
+
+   if(!ComputeDecisionScore(LastDecisionScore))
+      return;
+
+   DrawDashboard();
+   ManageTrailingSL();
+
+   if(TimeCurrent() - lastTradeTime < CooldownSeconds) 
+   { 
+      EA_Status = "Cooldown"; 
+      return; 
+   }
+
+   if(PositionSelect(_Symbol)==false) 
+   {
+      ENUM_ORDER_TYPE type;
+      double threshold = 0.5;
+
+      // Dominating factor logic
+      if(FactorTrend > threshold) type=ORDER_TYPE_BUY;
+      else if(FactorTrend < -threshold) type=ORDER_TYPE_SELL;
+      else if(FactorMomentum > threshold) type=ORDER_TYPE_BUY;
+      else if(FactorMomentum < -threshold) type=ORDER_TYPE_SELL;
+      else if(FactorVolatility > threshold) type=ORDER_TYPE_BUY;
+      else if(FactorVolatility < -threshold) type=ORDER_TYPE_SELL;
+      else if(FactorOscillator > threshold) type=ORDER_TYPE_BUY;
+      else if(FactorOscillator < -threshold) type=ORDER_TYPE_SELL;
+      else if(FactorVolume > threshold) type=ORDER_TYPE_BUY;
+      else if(FactorVolume < -threshold) type=ORDER_TYPE_SELL;
+      else return; // no clear factor
+
+      ExecuteTrade(type);
+   }
+}
+
+//+------------------------------------------------------------------+
+bool ComputeDecisionScore(double &score)
+{
+   double ema20[1], ema50[1], ema200[1];
+   double rsi[1], macdMain[1], macdSignal[1], atr[1];
+   double closeArr[2], highArr[1], lowArr[1];
+   long   volumeArr[1];
+
+   if(CopyBuffer(hEMA20,0,0,1,ema20)<=0) return false;
+   if(CopyBuffer(hEMA50,0,0,1,ema50)<=0) return false;
+   if(CopyBuffer(hEMA200,0,0,1,ema200)<=0) return false;
+   if(CopyBuffer(hRSI,0,0,1,rsi)<=0) return false;
+   if(CopyBuffer(hMACD,0,0,1,macdMain)<=0) return false;
+   if(CopyBuffer(hMACD,1,0,1,macdSignal)<=0) return false;
+   if(CopyBuffer(hATR,0,0,1,atr)<=0) return false;
+
+   if(CopyClose(_Symbol,PERIOD_M5,0,2,closeArr)<=1) return false;
+   if(CopyHigh(_Symbol,PERIOD_M5,0,1,highArr)<=0) return false;
+   if(CopyLow(_Symbol,PERIOD_M5,0,1,lowArr)<=0) return false;
+   if(CopyTickVolume(_Symbol,PERIOD_M5,0,20,volumeArr)<=0) return false;
+
+   // Convert long[] -> double[] for moving average
+   double volumeDouble[20];
+   for(int i=0;i<20;i++) volumeDouble[i] = (double)volumeArr[i];
+
+   // ===== Factor Calculations =====
+   FactorTrend      = ((ema20[0]-ema50[0]) + (ema50[0]-ema200[0])) / (ema200[0]*2);
+   FactorMomentum   = (closeArr[0]-closeArr[1])/closeArr[1]; 
+   FactorVolatility = atr[0]/closeArr[0];
+   FactorOscillator = (rsi[0]-50)/50.0;
+
+   // Volume factor: SMA of last 20 tick volumes
+   double volumeMA = 0.0;
+   for(int i=0;i<20;i++) volumeMA += volumeDouble[i];
+   volumeMA /= 20.0;
+   FactorVolume = (volumeDouble[0]-volumeMA)/volumeMA;
+
+   // Weighted normalized score
+   score = 0.4*FactorTrend + 0.15*FactorMomentum + 0.15*FactorVolatility + 0.15*FactorOscillator + 0.15*FactorVolume;
+   score = MathMax(-1.0,MathMin(1.0,score));
+   return true;
+}
+
+//+------------------------------------------------------------------+
+void ExecuteTrade(ENUM_ORDER_TYPE type)
+{
+   MqlTradeRequest req;
+   MqlTradeResult  res;
+   ZeroMemory(req); ZeroMemory(res);
+
+   req.action    = TRADE_ACTION_DEAL;
+   req.symbol    = _Symbol;
+   req.volume    = LotSize;
+   req.type      = type;
+   req.price     = (type==ORDER_TYPE_BUY)?SymbolInfoDouble(_Symbol,SYMBOL_ASK):SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   req.deviation = 20;
+   req.magic     = 777;
+   req.sl        = 0;  // NO LOSS
+   req.tp        = 0;
+
+   if(OrderSend(req,res) && res.retcode==TRADE_RETCODE_DONE)
+   {
+      lastTradeTime = TimeCurrent();
+      EA_LastAction = "Trade Opened";
+      PeakProfit = 0;
+      LastTicket = (ulong)PositionGetInteger(POSITION_TICKET);
+   }
+}
+
+//+------------------------------------------------------------------+
+void ManageTrailingSL()
+{
+   if(!PositionSelect(_Symbol)) return;
+
+   double profit = PositionGetDouble(POSITION_PROFIT);
+   if(profit <= 0) return;
+
+   ulong ticket = (ulong)PositionGetInteger(POSITION_TICKET);
+   ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+   if(profit > PeakProfit) PeakProfit = profit;
+
+   double trailProfit = PeakProfit*(1.0-TrailingPercent);
+   double tickValue = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+   double volume    = PositionGetDouble(POSITION_VOLUME);
+   double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+
+   double newSL = (type==POSITION_TYPE_BUY)
+                  ? openPrice + trailProfit/(tickValue*volume)*tickSize
+                  : openPrice - trailProfit/(tickValue*volume)*tickSize;
+
+   double currentSL = PositionGetDouble(POSITION_SL);
+   if((type==POSITION_TYPE_BUY && newSL<=currentSL) ||
+      (type==POSITION_TYPE_SELL && newSL>=currentSL)) return;
+
+   MqlTradeRequest req;
+   MqlTradeResult  res;
+   ZeroMemory(req); ZeroMemory(res);
+   req.action   = TRADE_ACTION_SLTP;
+   req.position = ticket;
+   req.symbol   = _Symbol;
+   req.sl       = NormalizeDouble(newSL,_Digits);
+   req.tp       = PositionGetDouble(POSITION_TP);
+   OrderSend(req,res);
+}
+
+//+------------------------------------------------------------------+
+bool SpreadTooHigh()
+{
+   double spread = (SymbolInfoDouble(_Symbol,SYMBOL_ASK)-SymbolInfoDouble(_Symbol,SYMBOL_BID))/_Point;
+   return spread > MaxSpreadPoints;
+}
+
+//+------------------------------------------------------------------+
+void DrawDashboard()
+{
+   Comment(
+      "XAUUSD 5-Factor Adaptive EA - NO LOSS\n",
+      "--------------------------------------\n",
+      "Status          : ",EA_Status,"\n",
+      "Decision Score  : ",DoubleToString(LastDecisionScore,3),"\n",
+      "Trend Factor    : ",DoubleToString(FactorTrend,3),"\n",
+      "Momentum Factor : ",DoubleToString(FactorMomentum,3),"\n",
+      "Volatility      : ",DoubleToString(FactorVolatility,3),"\n",
+      "Oscillator      : ",DoubleToString(FactorOscillator,3),"\n",
+      "Volume Factor   : ",DoubleToString(FactorVolume,3),"\n",
+      "Cooldown (sec)  : ",CooldownSeconds,"\n",
+      "Last Action     : ",EA_LastAction
+   );
+}
