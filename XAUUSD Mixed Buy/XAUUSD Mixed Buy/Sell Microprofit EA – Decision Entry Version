@@ -1,0 +1,380 @@
+//+------------------------------------------------------------------+
+//| XAUUSD Mixed Buy/Sell Microprofit EA - Decision Entry Version   |
+//+------------------------------------------------------------------+
+#property strict
+#property version "3.4"
+
+input double LotSize=0.01;
+input double TrailingSL=1.0;
+input double EntryGapUSD=2;
+input double CumulativeTarget=3.0;
+input double OffsetUSD=3.0;
+input int MaxOpenTrades=2;
+input int CooldownSeconds=1;
+
+input double BuyThreshold=0.05;
+input double SellThreshold=-0.05;
+
+datetime lastTradeTime=0;
+double lastPrice=0;
+
+bool BuyCycle=false;
+bool SellCycle=false;
+bool LastTradeWasSell=false;
+
+double UsedBuySteps[];
+double UsedSellSteps[];
+
+// Indicator handles
+int hEMA20;
+int hEMA50;
+int hEMA200;
+int hRSI;
+int hMACD;
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   lastPrice=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   hEMA20=iMA(_Symbol,PERIOD_M5,20,0,MODE_EMA,PRICE_CLOSE);
+   hEMA50=iMA(_Symbol,PERIOD_M5,50,0,MODE_EMA,PRICE_CLOSE);
+   hEMA200=iMA(_Symbol,PERIOD_M5,200,0,MODE_EMA,PRICE_CLOSE);
+   hRSI=iRSI(_Symbol,PERIOD_M5,14,PRICE_CLOSE);
+   hMACD=iMACD(_Symbol,PERIOD_M5,12,26,9,PRICE_CLOSE);
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+   if(TimeCurrent()-lastTradeTime<CooldownSeconds)
+      return;
+
+   // FIRST ENTRY USING DECISION ENGINE
+   if(PositionsTotal()==0)
+   {
+      double score;
+
+      if(ComputeDecisionScore(score))
+      {
+         if(score>=BuyThreshold)
+         {
+            ExecuteBuy();
+            return;
+         }
+
+         if(score<=SellThreshold)
+         {
+            ExecuteSell();
+            return;
+         }
+      }
+   }
+
+   double cumulativeProfit=GetCumulativeProfit();
+
+   if(cumulativeProfit>=CumulativeTarget)
+   {
+      double closePrice=bid;
+
+      CloseAllTrades();
+      lastTradeTime=TimeCurrent();
+
+      PlaceOffsetLimit(closePrice);
+
+      BuyCycle=!BuyCycle;
+      SellCycle=!SellCycle;
+
+      return;
+   }
+
+   if(!BuyCycle && CanOpenNewTrade())
+   {
+      if(FloatingSellAllowed(bid))
+         ExecuteSell();
+   }
+
+   if(!SellCycle && CanOpenNewTrade())
+   {
+      if(FloatingBuyAllowed(ask))
+         ExecuteBuy();
+   }
+
+   ManageTrailingSL();
+}
+
+//+------------------------------------------------------------------+
+bool ComputeDecisionScore(double &score)
+{
+   double ema20[1];
+   double ema50[1];
+   double ema200[1];
+   double rsi[1];
+   double macdMain[1];
+   double macdSignal[1];
+
+   if(CopyBuffer(hEMA20,0,0,1,ema20)<=0) return false;
+   if(CopyBuffer(hEMA50,0,0,1,ema50)<=0) return false;
+   if(CopyBuffer(hEMA200,0,0,1,ema200)<=0) return false;
+   if(CopyBuffer(hRSI,0,0,1,rsi)<=0) return false;
+   if(CopyBuffer(hMACD,0,0,1,macdMain)<=0) return false;
+   if(CopyBuffer(hMACD,1,0,1,macdSignal)<=0) return false;
+
+   double emaScore=((ema20[0]-ema50[0])+(ema50[0]-ema200[0]))/(ema200[0]*2);
+   double rsiScore=(rsi[0]-50)/50.0;
+   double macdScore=macdMain[0]-macdSignal[0];
+
+   score=0.4*emaScore+0.3*rsiScore+0.3*macdScore;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+double GetCumulativeProfit()
+{
+   double total=0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket=PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+
+      total+=PositionGetDouble(POSITION_PROFIT);
+   }
+
+   return total;
+}
+
+//+------------------------------------------------------------------+
+bool CanOpenNewTrade()
+{
+   int total=0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket=PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+
+      total++;
+   }
+
+   return total<MaxOpenTrades;
+}
+
+//+------------------------------------------------------------------+
+bool FloatingSellAllowed(double bid)
+{
+   if(!IsStepUsed(bid,false) && (PositionsTotal()==0 || bid<=lastPrice-EntryGapUSD))
+      return true;
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool FloatingBuyAllowed(double ask)
+{
+   if(!IsStepUsed(ask,true) && (PositionsTotal()==0 || ask>=lastPrice+EntryGapUSD))
+      return true;
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool IsStepUsed(double price,bool isBuy)
+{
+   if(isBuy)
+   {
+      for(int i=0;i<ArraySize(UsedBuySteps);i++)
+         if(MathAbs(price-UsedBuySteps[i])<_Point) return true;
+   }
+   else
+   {
+      for(int i=0;i<ArraySize(UsedSellSteps);i++)
+         if(MathAbs(price-UsedSellSteps[i])<_Point) return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+void RecordStep(double price,bool isBuy)
+{
+   if(isBuy)
+   {
+      int size=ArraySize(UsedBuySteps);
+      ArrayResize(UsedBuySteps,size+1);
+      UsedBuySteps[size]=price;
+   }
+   else
+   {
+      int size=ArraySize(UsedSellSteps);
+      ArrayResize(UsedSellSteps,size+1);
+      UsedSellSteps[size]=price;
+   }
+}
+
+//+------------------------------------------------------------------+
+void ExecuteSell()
+{
+   MqlTradeRequest req;
+   MqlTradeResult res;
+
+   ZeroMemory(req);
+   ZeroMemory(res);
+
+   req.action=TRADE_ACTION_DEAL;
+   req.symbol=_Symbol;
+   req.volume=LotSize;
+   req.type=ORDER_TYPE_SELL;
+   req.price=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   req.deviation=10;
+
+   if(OrderSend(req,res))
+   {
+      lastTradeTime=TimeCurrent();
+      lastPrice=req.price;
+
+      BuyCycle=false;
+      SellCycle=true;
+
+      LastTradeWasSell=true;
+
+      RecordStep(req.price,false);
+   }
+}
+
+//+------------------------------------------------------------------+
+void ExecuteBuy()
+{
+   MqlTradeRequest req;
+   MqlTradeResult res;
+
+   ZeroMemory(req);
+   ZeroMemory(res);
+
+   req.action=TRADE_ACTION_DEAL;
+   req.symbol=_Symbol;
+   req.volume=LotSize;
+   req.type=ORDER_TYPE_BUY;
+   req.price=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   req.deviation=10;
+
+   if(OrderSend(req,res))
+   {
+      lastTradeTime=TimeCurrent();
+      lastPrice=req.price;
+
+      BuyCycle=true;
+      SellCycle=false;
+
+      LastTradeWasSell=false;
+
+      RecordStep(req.price,true);
+   }
+}
+
+//+------------------------------------------------------------------+
+void ManageTrailingSL()
+{
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong ticket=PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+
+      double profit=PositionGetDouble(POSITION_PROFIT);
+
+      if(profit>=TrailingSL)
+      {
+         if(profit<=TrailingSL*0.5)
+            ClosePosition(ticket);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+void PlaceOffsetLimit(double price)
+{
+   MqlTradeRequest req;
+   MqlTradeResult res;
+
+   ZeroMemory(req);
+   ZeroMemory(res);
+
+   req.action=TRADE_ACTION_PENDING;
+   req.symbol=_Symbol;
+   req.volume=LotSize;
+   req.deviation=10;
+
+   if(LastTradeWasSell)
+   {
+      req.type=ORDER_TYPE_BUY_LIMIT;
+      req.price=price-OffsetUSD;
+   }
+   else
+   {
+      req.type=ORDER_TYPE_SELL_LIMIT;
+      req.price=price+OffsetUSD;
+   }
+
+   if(!OrderSend(req,res))
+      Print("Offset order failed ",GetLastError());
+}
+
+//+------------------------------------------------------------------+
+void CloseAllTrades()
+{
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong ticket=PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+
+      ClosePosition(ticket);
+   }
+}
+
+//+------------------------------------------------------------------+
+void ClosePosition(ulong ticket)
+{
+   if(!PositionSelectByTicket(ticket)) return;
+
+   MqlTradeRequest req;
+   MqlTradeResult res;
+
+   ZeroMemory(req);
+   ZeroMemory(res);
+
+   ENUM_POSITION_TYPE type=(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+   req.action=TRADE_ACTION_DEAL;
+   req.symbol=_Symbol;
+   req.position=ticket;
+   req.volume=PositionGetDouble(POSITION_VOLUME);
+   req.deviation=10;
+
+   if(type==POSITION_TYPE_BUY)
+   {
+      req.type=ORDER_TYPE_SELL;
+      req.price=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   }
+   else
+   {
+      req.type=ORDER_TYPE_BUY;
+      req.price=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   }
+
+   if(!OrderSend(req,res))
+      Print("Close failed ",GetLastError());
+}
