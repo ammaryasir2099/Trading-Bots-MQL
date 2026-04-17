@@ -1,6 +1,6 @@
 #property strict
 #include <Trade/Trade.mqh>
-
+#ammar.yasir2099@gmail.com
 CTrade trade;
 
 //================ INPUT =================
